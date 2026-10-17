@@ -34,7 +34,7 @@ The options are mutually exclusive; uncheck the selected option to disable autom
 
 ## Mouse polling and responsiveness
 
-While the desktop effects are running, the app checks the pointer position and mouse buttons on a 250 ms timer (about 6–7 checks per second). To adjust the responsiveness-versus-polling tradeoff, edit `$script:timer.Interval` in `IconsAndMouse.ps1` (the value is in milliseconds), then restart the app.  
+While the desktop effects are running, the app checks the pointer position and mouse buttons on a 250 ms timer. To adjust the responsiveness-versus-polling tradeoff, edit `$script:timer.Interval` in `IconsAndMouse.ps1` (the value is in milliseconds), then restart the app.
 A shorter interval checks more often and can respond sooner, at the cost of more frequent polling; a longer interval polls less often but may respond later or miss very brief mouse-button presses. The display resolution is updated from a Windows display-change event, not by this timer.
 
 ## Optional wallpaper slideshow
