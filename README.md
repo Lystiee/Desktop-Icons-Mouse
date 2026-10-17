@@ -1,7 +1,6 @@
 # Desktop Icons App
 
 A Windows PowerShell WinForms app specifically designed for OLED monitors. It can show desktop icons only in selected screen areas and hide the system cursor after it has been idle.
-Specifically designed for OLED monitors.
 
 ## Requirements
 
@@ -32,6 +31,11 @@ Choose one of the **Start with Windows** options to create a shortcut in the cur
 - **No notification-area icon** starts the desktop effects silently in the background, without a window or notification-area icon. Open the app manually to change settings or stop it.
 
 The options are mutually exclusive; uncheck the selected option to disable automatic startup. The startup shortcut uses Windows Script Host to launch PowerShell without briefly opening a console window. Existing shortcuts are updated to this silent launcher when you next open the app. A second manual launch brings the existing settings window forward, and the app prevents multiple instances of the desktop effects from running.
+
+## Mouse polling and responsiveness
+
+While the desktop effects are running, the app checks the pointer position and mouse buttons on a 250 ms timer (about 6–7 checks per second). To adjust the responsiveness-versus-polling tradeoff, edit `$script:timer.Interval` in `IconsAndMouse.ps1` (the value is in milliseconds), then restart the app.  
+A shorter interval checks more often and can respond sooner, at the cost of more frequent polling; a longer interval polls less often but may respond later or miss very brief mouse-button presses. The display resolution is updated from a Windows display-change event, not by this timer.
 
 ## Optional wallpaper slideshow
 
