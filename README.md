@@ -51,9 +51,15 @@ Edit the `Interval` DWORD value. For example, hexadecimal `4e20` (decimal `20000
 
 ## Settings and troubleshooting
 
-Settings are saved to `%APPDATA%\DesktopIconsApp\settings.json`. Errors from the headless sign-in instance are logged to `%APPDATA%\DesktopIconsApp\errors.log`.
+Settings and the headless error log are stored in this folder:
 
-If the desktop effects fail, open the app and choose **Stop** to restore the desktop state. While the cursor is hidden, a small hidden recovery process monitors the app and restores system cursors if the app exits unexpectedly. If a headless instance reports an error, check the log file above. You can disable automatic startup by unchecking the selected **Start with Windows** option in the app.
+```text
+C:\Users\<your-username>\AppData\Roaming\DesktopIconsApp
+```
+
+The folder contains `settings.json` and, when **Write headless errors to errors.log** is enabled, `errors.log`. Error logging is enabled by default; uncheck the option to disable file logging for headless startup and cursor-recovery errors. Errors in a manually opened app are still shown in a dialog. To open the folder quickly, press **Windows+R**, enter `%APPDATA%\DesktopIconsApp`, and press **Enter**. `%APPDATA%` resolves to your own `C:\Users\<your-username>\AppData\Roaming` folder.
+
+If the desktop effects fail, open the app and choose **Stop** to restore the desktop state. While the cursor is hidden, a small hidden recovery process monitors the app and restores system cursors if the app exits unexpectedly. For errors from a headless startup, check `errors.log` in the folder above. You can disable automatic startup by unchecking the selected **Start with Windows** option in the app.
 
 ## License
 

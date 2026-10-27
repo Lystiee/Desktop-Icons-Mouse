@@ -3,13 +3,42 @@ param(
     [switch]$StartInTray,
     [int]$CursorRecoveryForPid = 0,
     [string]$CursorRecoveryEventName = '',
-    [string]$CursorRecoveryReadyEventName = ''
+    [string]$CursorRecoveryReadyEventName = '',
+    [switch]$DisableErrorLog
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Must run before any window is created
+# Unhandled WinForms exceptions are logged
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+[System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
+    param($sender, $e)
+    Write-AppLog "Unhandled: $($e.Exception.Message)"
+})
+
+# Error logging is optional: the -DisableErrorLog switch always wins over the saved setting
+$script:writeErrorLog = -not $DisableErrorLog
+
+function Write-AppLog([string]$message) {
+    if (-not $script:writeErrorLog) { return }
+    try {
+        $logPath = Join-Path (Join-Path $env:APPDATA 'DesktopIconsApp') 'errors.log'
+        $logDirectory = Split-Path -Parent $logPath
+        if (-not (Test-Path -LiteralPath $logDirectory)) {
+            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+        }
+        # Keep the log from growing without bound (one rotated copy)
+        if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 512KB) {
+            Move-Item -LiteralPath $logPath -Destination ($logPath + '.old') -Force
+        }
+        Add-Content -LiteralPath $logPath -Value ('{0:u} {1}' -f [DateTime]::Now, $message) -Encoding UTF8
+    } catch { }   # logging must never throw
+}
+
+if ($CursorRecoveryForPid -eq 0) {
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -48,10 +77,10 @@ public static class DesktopIconsAppNative {
         32644, 32645, 32646, 32648, 32649, 32650
     };
 
-    public static POINT CursorPosition() {
+    // Returns null when the cursor position is unavailable (secure desktop: UAC, Ctrl+Alt+Del, lock screen).
+    public static POINT? TryCursorPosition() {
         POINT point;
-        if (!GetCursorPos(out point)) throw new Win32Exception(Marshal.GetLastWin32Error());
-        return point;
+        return GetCursorPos(out point) ? (POINT?)point : null;
     }
 
     public static int ScreenWidth() { return GetSystemMetrics(0); }
@@ -108,32 +137,48 @@ public static class DesktopIconsAppNative {
     }
 }
 "@
+}
 
 $script:settingsPath = Join-Path $env:APPDATA 'DesktopIconsApp\settings.json'
 if ($CursorRecoveryForPid -gt 0) {
+    Add-Type @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class DesktopIconsAppRecoveryNative {
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SystemParametersInfo(uint action, uint parameter, IntPtr value, uint flags);
+
+    public static void RestoreCursor() {
+        if (!SystemParametersInfo(0x0057, 0, IntPtr.Zero, 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not restore the system cursors.");
+    }
+}
+"@
     $recoveryEvent = $null
     $readyEvent = $null
     $parentProcess = $null
     try {
-        $parentProcess = [System.Diagnostics.Process]::GetProcessById($CursorRecoveryForPid)
         $recoveryEvent = [System.Threading.EventWaitHandle]::OpenExisting($CursorRecoveryEventName)
         $readyEvent = [System.Threading.EventWaitHandle]::OpenExisting($CursorRecoveryReadyEventName)
         $readyEvent.Set() | Out-Null
+        try {
+            $parentProcess = [System.Diagnostics.Process]::GetProcessById($CursorRecoveryForPid)
+        } catch [System.ArgumentException] {
+            [DesktopIconsAppRecoveryNative]::RestoreCursor()
+            exit 0
+        }
         while ($true) {
             if ($recoveryEvent.WaitOne(500)) { break }
             if ($parentProcess.HasExited) {
-                [DesktopIconsAppNative]::RestoreCursor()
+                [DesktopIconsAppRecoveryNative]::RestoreCursor()
                 break
             }
         }
         exit 0
     } catch {
-        $logPath = Join-Path (Split-Path -Parent $script:settingsPath) 'errors.log'
-        $logDirectory = Split-Path -Parent $logPath
-        if (-not (Test-Path -LiteralPath $logDirectory)) {
-            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-        }
-        Add-Content -LiteralPath $logPath -Value ('{0:u} Cursor recovery failed: {1}' -f [DateTime]::Now, $_.Exception.Message) -Encoding UTF8
+        Write-AppLog "Cursor recovery failed: $($_.Exception.Message)"
         exit 1
     } finally {
         if ($recoveryEvent) { $recoveryEvent.Dispose() }
@@ -178,6 +223,7 @@ $script:zones = @(
 )
 $script:iconsVisible = $true
 $script:cursorHidden = $false
+$script:cursorBackoffUntil = 0
 $script:leftZoneAt = $null
 $script:lastCursorPosition = $null
 $script:activityClock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -187,17 +233,15 @@ $script:dragCurrent = $null
 $script:selectedZone = -1
 $script:closingForExit = $false
 $script:headlessStartFailed = $false
+$script:tickFailures = 0
+$script:maxTickFailures = 40   # ~10 s of consecutive failed ticks (250 ms each) before giving up
 
 function Show-AppError([string]$message) {
     if ($Headless) {
-        $logPath = Join-Path (Split-Path -Parent $script:settingsPath) 'errors.log'
-        $logDirectory = Split-Path -Parent $logPath
-        if (-not (Test-Path -LiteralPath $logDirectory)) {
-            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-        }
-        Add-Content -LiteralPath $logPath -Value ('{0:u} {1}' -f [DateTime]::Now, $message) -Encoding UTF8
+        Write-AppLog $message
         return
     }
+    Write-AppLog $message
     [System.Windows.Forms.MessageBox]::Show(
         $message, 'Desktop Icons App', [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -208,6 +252,15 @@ function Show-SettingsWindow {
     $script:form.Show()
     $script:form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
     $script:form.Activate()
+}
+
+# WaitOne(0) that treats an abandoned mutex (previous owner was killed) as acquired
+function Try-AcquireAutomationMutex {
+    try {
+        return $script:automationMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        return $true
+    }
 }
 
 function Start-CursorRecoveryWatcher {
@@ -222,11 +275,12 @@ function Start-CursorRecoveryWatcher {
         $false, [System.Threading.EventResetMode]::ManualReset, $readyEventName
     )
     try {
-        $arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -CursorRecoveryForPid {1} -CursorRecoveryEventName "{2}" -CursorRecoveryReadyEventName "{3}"' -f $PSCommandPath, $PID, $eventName, $readyEventName
+        $loggingArgument = if ($script:writeErrorLog) { '' } else { ' -DisableErrorLog' }
+        $arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -CursorRecoveryForPid {1} -CursorRecoveryEventName "{2}" -CursorRecoveryReadyEventName "{3}"{4}' -f $PSCommandPath, $PID, $eventName, $readyEventName, $loggingArgument
         $script:cursorRecoveryProcess = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
             -ArgumentList $arguments -WindowStyle Hidden -PassThru
-        if (-not $script:cursorRecoveryReadyEvent.WaitOne(10000)) {
-            throw 'Cursor recovery helper did not start within 10 seconds.'
+        if (-not $script:cursorRecoveryReadyEvent.WaitOne(30000)) {
+            throw 'Cursor recovery helper did not become ready within 30 seconds.'
         }
         $script:cursorRecoveryReadyEvent.Dispose()
         $script:cursorRecoveryReadyEvent = $null
@@ -252,11 +306,13 @@ function Stop-CursorRecoveryWatcher {
     }
 }
 
+# Compares against the real desktop state so a cached value can't desync
+# (Explorer restart, resolution change refreshing the desktop, etc)
 function Set-IconsVisible([bool]$visible) {
-    if ($script:iconsVisible -ne $visible) {
+    if ([DesktopIconsAppNative]::AreIconsVisible() -ne $visible) {
         [DesktopIconsAppNative]::SetIconsVisible($visible)
-        $script:iconsVisible = $visible
     }
+    $script:iconsVisible = $visible
 }
 
 function Restore-AppState {
@@ -299,15 +355,27 @@ function Save-Settings {
         })
         HideIcons = $script:hideIconsCheck.Checked
         HideCursor = $script:hideCursorCheck.Checked
+        LogErrors = $script:logErrorsCheck.Checked
         HideDelayMs = [int]$script:hideDelayInput.Value
         IdleHideMs = [int]$script:idleHideInput.Value
     }
-    $settings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:settingsPath -Encoding UTF8
+    # Atomic write: a crash mid-write can't leave a corrupt settings.json
+    $tempPath = $script:settingsPath + '.tmp'
+    $settings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $script:settingsPath -Force
 }
 
 function Load-Settings {
     if (-not (Test-Path -LiteralPath $script:settingsPath)) { return }
-    $settings = Get-Content -LiteralPath $script:settingsPath -Raw | ConvertFrom-Json
+    try {
+        $settings = Get-Content -LiteralPath $script:settingsPath -Raw | ConvertFrom-Json
+    } catch {
+        # Corrupt file: set it aside and fall back to defaults instead of failing startup
+        Write-AppLog "settings.json is unreadable, using defaults: $($_.Exception.Message)"
+        try { Move-Item -LiteralPath $script:settingsPath -Destination ($script:settingsPath + '.corrupt') -Force } catch { }
+        return
+    }
+    if ($null -eq $settings) { return }
     if ($null -ne $settings.Zones) {
         $loadedZones = @()
         foreach ($zone in $settings.Zones) {
@@ -326,6 +394,11 @@ function Load-Settings {
     }
     if ($null -ne $settings.HideIcons) { $script:hideIconsCheck.Checked = [bool]$settings.HideIcons }
     if ($null -ne $settings.HideCursor) { $script:hideCursorCheck.Checked = [bool]$settings.HideCursor }
+    if ($null -ne $settings.LogErrors) {
+        $script:logErrorsCheck.Checked = [bool]$settings.LogErrors
+    }
+    # The -DisableErrorLog switch always overrides the saved preference
+    $script:writeErrorLog = $script:logErrorsCheck.Checked -and -not $DisableErrorLog
     if ($null -ne $settings.HideDelayMs -and
         $settings.HideDelayMs -ge $script:hideDelayInput.Minimum -and
         $settings.HideDelayMs -le $script:hideDelayInput.Maximum) {
@@ -340,7 +413,7 @@ function Load-Settings {
 
 function Start-Automation {
     if (-not $script:ownsAutomationMutex) {
-        if (-not $script:automationMutex.WaitOne(0)) {
+        if (-not (Try-AcquireAutomationMutex)) {
             throw 'The desktop effects are already running in another app instance.'
         }
         $script:ownsAutomationMutex = $true
@@ -352,6 +425,7 @@ function Start-Automation {
         Save-Settings
         $script:activityClock.Restart()
         $script:leftZoneAt = $null
+        $script:tickFailures = 0
         $script:timer.Start()
         $script:startButton.Enabled = $false
         $script:stopButton.Enabled = $true
@@ -437,8 +511,8 @@ function Set-StartupShortcut([string]$mode) {
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = 'Desktop Icons App'
 $script:form.StartPosition = 'CenterScreen'
-$script:form.ClientSize = [System.Drawing.Size]::new(600, 505)
-$script:form.MinimumSize = [System.Drawing.Size]::new(616, 544)
+$script:form.ClientSize = [System.Drawing.Size]::new(600, 537)
+$script:form.MinimumSize = [System.Drawing.Size]::new(616, 576)
 $script:form.MaximizeBox = $false
 $script:form.ShowInTaskbar = -not $Headless
 $script:form.Opacity = if ($Headless) { 0 } else { 1 }
@@ -523,27 +597,36 @@ $script:startupHeadlessCheck.Location = [System.Drawing.Point]::new(18, 428)
 $script:startupHeadlessCheck.AutoSize = $true
 $script:form.Controls.Add($script:startupHeadlessCheck)
 
+$script:logErrorsCheck = New-Object System.Windows.Forms.CheckBox
+$script:logErrorsCheck.Text = 'Write errors to errors.log (optional)'
+$script:logErrorsCheck.Location = [System.Drawing.Point]::new(18, 449)
+$script:logErrorsCheck.AutoSize = $true
+
+# Change to $false if you want logging off until the user enables it
+$script:logErrorsCheck.Checked = $true
+$script:form.Controls.Add($script:logErrorsCheck)
+
 $script:statusLabel = New-Object System.Windows.Forms.Label
 $script:statusLabel.Text = 'Stopped'
-$script:statusLabel.Location = [System.Drawing.Point]::new(18, 462)
+$script:statusLabel.Location = [System.Drawing.Point]::new(18, 494)
 $script:statusLabel.AutoSize = $true
 $script:form.Controls.Add($script:statusLabel)
 
 $script:startButton = New-Object System.Windows.Forms.Button
 $script:startButton.Text = 'Start'
-$script:startButton.Location = [System.Drawing.Point]::new(306, 450)
+$script:startButton.Location = [System.Drawing.Point]::new(306, 482)
 $script:startButton.Size = [System.Drawing.Size]::new(86, 34)
 $script:form.Controls.Add($script:startButton)
 
 $saveButton = New-Object System.Windows.Forms.Button
 $saveButton.Text = 'Save settings'
-$saveButton.Location = [System.Drawing.Point]::new(402, 450)
+$saveButton.Location = [System.Drawing.Point]::new(402, 482)
 $saveButton.Size = [System.Drawing.Size]::new(86, 34)
 $script:form.Controls.Add($saveButton)
 
 $script:stopButton = New-Object System.Windows.Forms.Button
 $script:stopButton.Text = 'Stop'
-$script:stopButton.Location = [System.Drawing.Point]::new(494, 450)
+$script:stopButton.Location = [System.Drawing.Point]::new(494, 482)
 $script:stopButton.Size = [System.Drawing.Size]::new(86, 34)
 $script:stopButton.Enabled = $true
 $script:form.Controls.Add($script:stopButton)
@@ -680,7 +763,11 @@ $script:zoneList.Add_SelectedIndexChanged({
 $removeZone.Add_Click({
     $index = $script:zoneList.SelectedIndex
     if ($index -ge 0) {
-        $script:zones = @($script:zones | Where-Object { $_ -ne $script:zones[$index] })
+        $kept = @()
+        for ($i = 0; $i -lt $script:zones.Count; $i++) {
+            if ($i -ne $index) { $kept += $script:zones[$i] }
+        }
+        $script:zones = @($kept)
         $script:selectedZone = -1
         Update-Preview
     }
@@ -719,7 +806,23 @@ $script:stopButton.Add_Click({
 
 $script:timer.Add_Tick({
     try {
-        $position = [DesktopIconsAppNative]::CursorPosition()
+        # Resolution / display changes are detected by polling (no cross-thread event needed)
+        $width = [DesktopIconsAppNative]::ScreenWidth()
+        $height = [DesktopIconsAppNative]::ScreenHeight()
+        if ($width -gt 0 -and $height -gt 0 -and
+            ($width -ne $script:screenWidth -or $height -ne $script:screenHeight)) {
+            $script:screenWidth = $width
+            $script:screenHeight = $height
+            $script:preview.Invalidate()
+        }
+
+        # Cursor position is unavailable on the secure desktop: just skip this tick
+        $position = [DesktopIconsAppNative]::TryCursorPosition()
+        if ($null -eq $position) { return }
+
+        # Re-sync with the real desktop state (Explorer restart, display change)
+        $script:iconsVisible = [DesktopIconsAppNative]::AreIconsVisible()
+
         $x = $position.X / [double]$script:screenWidth
         $y = $position.Y / [double]$script:screenHeight
         $inZone = $false
@@ -759,17 +862,34 @@ $script:timer.Add_Tick({
             }
         }
         elseif ($script:hideCursorCheck.Checked -and -not $script:cursorHidden -and
-            $script:activityClock.ElapsedMilliseconds -ge $script:idleHideInput.Value) {
-            Start-CursorRecoveryWatcher
-            $script:cursorHidden = $true
-            [DesktopIconsAppNative]::HideCursor()
+            $script:activityClock.ElapsedMilliseconds -ge $script:idleHideInput.Value -and
+            $script:zoneClock.ElapsedMilliseconds -ge $script:cursorBackoffUntil) {
+            try {
+                Start-CursorRecoveryWatcher
+                [DesktopIconsAppNative]::HideCursor()
+                $script:cursorHidden = $true
+            } catch {
+                # Don't kill the whole automation over a cursor failure; back off and retry later
+                Write-AppLog "Could not hide cursor: $($_.Exception.Message)"
+                try { [DesktopIconsAppNative]::RestoreCursor() } catch { }
+                $script:cursorHidden = $false
+                Stop-CursorRecoveryWatcher
+                $script:cursorBackoffUntil = $script:zoneClock.ElapsedMilliseconds + 10000
+            }
         }
         elseif (-not $script:hideCursorCheck.Checked -and $script:cursorHidden) {
             [DesktopIconsAppNative]::RestoreCursor()
             $script:cursorHidden = $false
             Stop-CursorRecoveryWatcher
         }
+
+        $script:tickFailures = 0
     } catch {
+        # Tolerate transient failures
+        $script:tickFailures++
+        Write-AppLog "Tick failed ($($script:tickFailures)/$($script:maxTickFailures)): $($_.Exception.Message)"
+        if ($script:tickFailures -lt $script:maxTickFailures) { return }
+
         $script:timer.Stop()
         $message = $_.Exception.Message
         try {
@@ -808,7 +928,9 @@ $script:form.Add_Resize({
 
 $script:form.Add_FormClosing({
     param($sender, $eventArgs)
-    if (-not $script:closingForExit) {
+    # Only intercept the user's own close; never block Windows shutdown / logoff
+    if (-not $script:closingForExit -and
+        $eventArgs.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
         $eventArgs.Cancel = $true
         $script:form.Hide()
         return
@@ -819,9 +941,13 @@ $script:form.Add_FormClosing({
         Restore-AppState
         Release-AutomationMutex
     } catch {
-        $eventArgs.Cancel = $true
-        Show-AppError "Could not restore the desktop state: $($_.Exception.Message)"
-        return
+        if ($eventArgs.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+            $eventArgs.Cancel = $true
+            Show-AppError "Could not restore the desktop state: $($_.Exception.Message)"
+            return
+        }
+        # During shutdown/logoff, never block the close
+        Write-AppLog "Restore during shutdown failed: $($_.Exception.Message)"
     }
     $script:notifyIcon.Visible = $false
 })
@@ -831,35 +957,18 @@ $script:form.Add_FormClosed({
 })
 
 $null = $script:form.Handle
-$script:displaySettingsHandler = [System.EventHandler]{
-    if ($script:form.IsDisposed -or -not $script:form.IsHandleCreated) { return }
-    try {
-        $updateDisplay = [System.Action]{
-            try {
-                $width = [DesktopIconsAppNative]::ScreenWidth()
-                $height = [DesktopIconsAppNative]::ScreenHeight()
-                if ($width -gt 0 -and $height -gt 0 -and
-                    ($width -ne $script:screenWidth -or $height -ne $script:screenHeight)) {
-                    $script:screenWidth = $width
-                    $script:screenHeight = $height
-                    $script:preview.Invalidate()
-                }
-            } catch {
-                Show-AppError "Could not update display dimensions: $($_.Exception.Message)"
-            }
-        }
-        [void]$script:form.BeginInvoke($updateDisplay)
-    } catch {
-        if (-not $script:form.IsDisposed) {
-            Show-AppError "Could not schedule a display update: $($_.Exception.Message)"
-        }
-    }
-}
-[Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged($script:displaySettingsHandler)
 
+# Read the startup mode first so a failure in Load-Settings can never turn into a bogus shortcut
+$startupMode = 'None'
+$startupModeKnown = $false
+try {
+    $startupMode = Get-StartupMode
+    $startupModeKnown = $true
+} catch {
+    Write-AppLog "Could not read startup mode: $($_.Exception.Message)"
+}
 try {
     Load-Settings
-    $startupMode = Get-StartupMode
     $script:startupTrayCheck.Checked = $startupMode -eq 'Tray'
     $script:startupHeadlessCheck.Checked = $startupMode -eq 'Headless'
     Update-Preview
@@ -867,7 +976,7 @@ try {
     Show-AppError "Could not load settings: $($_.Exception.Message)"
     if ($Headless -or $StartInTray) { $script:headlessStartFailed = $true }
 }
-if ($startupMode -ne 'None') {
+if ($startupModeKnown -and $startupMode -ne 'None') {
     try {
         Set-StartupShortcut $startupMode
     } catch {
@@ -899,11 +1008,21 @@ $script:updateStartupOptions = {
 $script:updatingStartupOptions = $false
 $script:startupTrayCheck.Add_CheckedChanged($script:updateStartupOptions)
 $script:startupHeadlessCheck.Add_CheckedChanged($script:updateStartupOptions)
+$script:logErrorsCheck.Add_CheckedChanged({
+    $script:writeErrorLog = $script:logErrorsCheck.Checked -and -not $DisableErrorLog
+    try {
+        Save-Settings
+    } catch {
+        $script:logErrorsCheck.Checked = -not $script:logErrorsCheck.Checked
+        $script:writeErrorLog = $script:logErrorsCheck.Checked -and -not $DisableErrorLog
+        Show-AppError "Could not save error-log preference: $($_.Exception.Message)"
+    }
+})
 
 if ($Headless -or $StartInTray) {
     if (-not $script:headlessStartFailed) {
         try {
-            if (-not $script:automationMutex.WaitOne(0)) {
+            if (-not (Try-AcquireAutomationMutex)) {
                 if ($Headless) {
                     $script:closingForExit = $true
                     $script:headlessStopEvent.Dispose()
@@ -923,9 +1042,11 @@ if ($Headless -or $StartInTray) {
         }
     }
 }
-if (-not $Headless) {
-    $script:housekeepingTimer.Start()
-}
+
+# Needed in every mode: headless instances use it to notice the stop request
+# UI instances use it to notice "show settings" requests from a second launch
+$script:housekeepingTimer.Start()
+
 try {
     if (-not ($Headless -and $script:headlessStartFailed)) {
         if ($Headless -or $StartInTray) {
@@ -935,7 +1056,6 @@ try {
         }
     }
 } finally {
-    [Microsoft.Win32.SystemEvents]::remove_DisplaySettingsChanged($script:displaySettingsHandler)
     if ($script:ownsAutomationMutex) { Release-AutomationMutex }
     if ($script:uiMutex) {
         $script:uiMutex.ReleaseMutex()
