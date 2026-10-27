@@ -17,6 +17,8 @@ powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File
 
 The execution-policy bypass in this command applies only to the launched PowerShell process; it does not change your system-wide policy. Review the script before running it, especially if you obtained it from someone else.
 
+The app might need a computer restart after its first configuration.
+
 ## Use
 
 In the screen preview, drag to add areas where desktop icons should be visible. Select an area and choose **Remove selected** to delete it. With **Show desktop icons only inside these areas** enabled, icons appear while the pointer is inside an area and hide after the configured delay outside all areas.
