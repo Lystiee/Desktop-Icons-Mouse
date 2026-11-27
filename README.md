@@ -18,15 +18,16 @@ Options:
 
 ## Install and run
 
-Download or copy `IconsAndMouse.ps1` to a folder on your computer. Open PowerShell in that folder and run:
+Download / extract the IconsAndMouse.ps1 file to any folder. (Preferably in a non temp folder, file must remain accessible)
+In that folder run the following by copy paste it in Windows Document Explorer bar :
 
 ```powershell
 powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ".\IconsAndMouse.ps1"
 ```
 
+A computer restart after configuration might be needed.
 The execution-policy bypass in this command applies only to the launched PowerShell process; it does not change your system-wide policy. Review the script before running it, especially if you obtained it from someone else.
 
-The app might need a computer restart after its first configuration.
 
 ## Use
 
