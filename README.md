@@ -16,9 +16,9 @@ Options:
 - Windows with Windows PowerShell 5.1
 - The app uses the primary display, refreshes its screen measurements when Windows reports a display-settings change, and requires no additional dependencies.
 
-## Install and run
+## How to use
+Download / extract the IconsAndMouse.ps1 file to any folder. (Preferably in a non temp folder, file must remain accessible).
 
-Download / extract the IconsAndMouse.ps1 file to any folder. (Preferably in a non temp folder, file must remain accessible)
 In that folder run the following by copy paste it in Windows Document Explorer bar :
 
 ```powershell
@@ -26,8 +26,8 @@ powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File
 ```
 
 A computer restart after configuration might be needed.
-The execution-policy bypass in this command applies only to the launched PowerShell process; it does not change your system-wide policy. Review the script before running it, especially if you obtained it from someone else.
 
+The execution-policy bypass in this command applies only to the launched PowerShell process; it does not change your system-wide policy.
 
 ## Use
 
