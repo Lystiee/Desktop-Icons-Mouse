@@ -1,6 +1,15 @@
-# Desktop Icons App
+# Desktop Icons and Mouse auto-hide app
 
-A Windows PowerShell WinForms app specifically designed for OLED monitors. It can show desktop icons only in selected screen areas and hide the system cursor after it has been idle.
+A Windows PowerShell WinForms app specifically designed for OLED monitors. 
+
+Main features:
+- Can auto hide desktop (after some user defined time) icons in selected screen areas and show them on mouse hover over selected areas.
+- Can auto hide mouse cursor after it has been idle (user defined elapsed time) and makes it visible again on movement activity.
+
+Options:
+- (Windows 10 specific) Mask the taskbar's "Show desktop" bar. The one typically found towards the edge of the taskbar.
+- (Windows 10 specific) Mask the edge line for any app that is currently in focus in taskbar.
+- Auto start on Windows session, with or without app notification icon.
 
 ## Requirements
 
