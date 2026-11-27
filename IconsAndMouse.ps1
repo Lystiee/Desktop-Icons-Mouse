@@ -41,12 +41,55 @@ function Write-AppLog([string]$message) {
 if ($CursorRecoveryForPid -eq 0) {
 Add-Type @"
 using System;
+using System.Drawing;
 using System.Runtime.InteropServices;
 using System.ComponentModel;
+using System.Text;
 
 public static class DesktopIconsAppNative {
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WNDCLASSEX {
+        public uint cbSize;
+        public uint style;
+        public WindowProc lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public string lpszMenuName;
+        public string lpszClassName;
+        public IntPtr hIconSm;
+    }
+
+    delegate IntPtr WindowProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    delegate bool EnumChildWindowsProc(IntPtr window, IntPtr parameter);
+
+    const uint WS_CHILD = 0x40000000;
+    const uint WS_CLIPSIBLINGS = 0x04000000;
+    const uint WS_EX_LAYERED = 0x00080000;
+    const uint WS_EX_TRANSPARENT = 0x00000020;
+    const uint WS_EX_NOACTIVATE = 0x08000000;
+    const uint LWA_ALPHA = 0x00000002;
+    const uint SWP_NOACTIVATE = 0x0010;
+    const uint SWP_SHOWWINDOW = 0x0040;
+    const int BLACK_BRUSH = 4;
+    const uint WM_NCHITTEST = 0x0084;
+    const uint WM_MOUSEACTIVATE = 0x0021;
+    const int HTTRANSPARENT = -1;
+    const int MA_NOACTIVATE = 3;
+    const string TaskbarMaskClassName = "DesktopIconsAppTaskbarMask";
+    static readonly WindowProc taskbarMaskProc = TaskbarMaskWindowProc;
+    static bool taskbarMaskClassRegistered;
+    static IntPtr taskbarMaskWindow = IntPtr.Zero;
+    static IntPtr taskbarMaskParent = IntPtr.Zero;
+    static IntPtr screenEdgeMaskWindow = IntPtr.Zero;
+    static IntPtr screenEdgeMaskParent = IntPtr.Zero;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool GetCursorPos(out POINT point);
@@ -54,6 +97,41 @@ public static class DesktopIconsAppNative {
     static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string windowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindow(string className, string windowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr window, StringBuilder className, int maxCount);
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr parent, EnumChildWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool GetWindowRect(IntPtr window, out RECT rect);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool ScreenToClient(IntPtr window, ref POINT point);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern ushort RegisterClassEx(ref WNDCLASSEX windowClass);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateWindowEx(uint extendedStyle, string className, string windowName,
+        uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu,
+        IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetLayeredWindowAttributes(IntPtr window, uint colorKey, byte alpha, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width,
+        int height, uint flags);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool DestroyWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")]
+    static extern IntPtr DefWindowProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("gdi32.dll")]
+    static extern IntPtr GetStockObject(int objectIndex);
+    [DllImport("kernel32.dll")]
+    static extern uint GetCurrentProcessId();
     [DllImport("user32.dll")]
     static extern bool ShowWindow(IntPtr handle, int command);
     [DllImport("user32.dll")]
@@ -85,6 +163,268 @@ public static class DesktopIconsAppNative {
 
     public static int ScreenWidth() { return GetSystemMetrics(0); }
     public static int ScreenHeight() { return GetSystemMetrics(1); }
+
+    static IntPtr TaskbarMaskWindowProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam) {
+        if (message == WM_NCHITTEST) return new IntPtr(HTTRANSPARENT);
+        if (message == WM_MOUSEACTIVATE) return new IntPtr(MA_NOACTIVATE);
+        return DefWindowProc(window, message, wParam, lParam);
+    }
+
+    static string LastError(string operation) {
+        return operation + " " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
+    }
+
+    static bool IsTaskbarMaskWindow() {
+        if (taskbarMaskWindow == IntPtr.Zero || !IsWindow(taskbarMaskWindow)) return false;
+        uint processId;
+        if (GetWindowThreadProcessId(taskbarMaskWindow, out processId) == 0 ||
+            processId != GetCurrentProcessId() ||
+            GetParent(taskbarMaskWindow) != taskbarMaskParent) return false;
+        StringBuilder className = new StringBuilder(128);
+        return GetClassName(taskbarMaskWindow, className, className.Capacity) > 0 &&
+            className.ToString() == TaskbarMaskClassName;
+    }
+
+    static bool IsScreenEdgeMaskWindow() {
+        if (screenEdgeMaskWindow == IntPtr.Zero || !IsWindow(screenEdgeMaskWindow)) return false;
+        uint processId;
+        if (GetWindowThreadProcessId(screenEdgeMaskWindow, out processId) == 0 ||
+            processId != GetCurrentProcessId() ||
+            GetParent(screenEdgeMaskWindow) != screenEdgeMaskParent) return false;
+        StringBuilder className = new StringBuilder(128);
+        return GetClassName(screenEdgeMaskWindow, className, className.Capacity) > 0 &&
+            className.ToString() == TaskbarMaskClassName;
+    }
+
+    static string DestroyTaskbarMaskWindow() {
+        if (IsTaskbarMaskWindow() && !DestroyWindow(taskbarMaskWindow))
+            return LastError("Could not remove the taskbar mask window:");
+        taskbarMaskWindow = IntPtr.Zero;
+        taskbarMaskParent = IntPtr.Zero;
+        return null;
+    }
+
+    static string DestroyScreenEdgeMaskWindow() {
+        if (IsScreenEdgeMaskWindow() && !DestroyWindow(screenEdgeMaskWindow))
+            return LastError("Could not remove the screen-edge mask window:");
+        screenEdgeMaskWindow = IntPtr.Zero;
+        screenEdgeMaskParent = IntPtr.Zero;
+        return null;
+    }
+
+    static IntPtr FindShowDesktopButton(IntPtr taskbar) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(taskbar, delegate(IntPtr window, IntPtr parameter) {
+            StringBuilder className = new StringBuilder(128);
+            if (GetClassName(window, className, className.Capacity) > 0 &&
+                className.ToString().IndexOf("ShowDesktop", StringComparison.OrdinalIgnoreCase) >= 0) {
+                found = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    static bool RegisterTaskbarMaskClass(out string error) {
+        error = null;
+        if (taskbarMaskClassRegistered) return true;
+        WNDCLASSEX windowClass = new WNDCLASSEX();
+        windowClass.cbSize = (uint)Marshal.SizeOf(typeof(WNDCLASSEX));
+        windowClass.lpfnWndProc = taskbarMaskProc;
+        windowClass.hInstance = GetModuleHandle(null);
+        windowClass.hbrBackground = GetStockObject(BLACK_BRUSH);
+        windowClass.lpszClassName = TaskbarMaskClassName;
+        if (RegisterClassEx(ref windowClass) == 0) {
+            error = LastError("Could not register the taskbar mask window:");
+            return false;
+        }
+        taskbarMaskClassRegistered = true;
+        return true;
+    }
+
+    public static string SyncTaskbarMask(bool enabled) {
+        if (!enabled) {
+            return DestroyTaskbarMaskWindow();
+        }
+
+        IntPtr taskbar = FindWindow("Shell_TrayWnd", null);
+        if (taskbar == IntPtr.Zero) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return "Could not find the Windows taskbar.";
+        }
+        IntPtr button = FindShowDesktopButton(taskbar);
+        if (button == IntPtr.Zero) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return "Could not locate the taskbar's Show desktop button.";
+        }
+
+        RECT taskbarRect;
+        RECT buttonRect;
+        if (!GetWindowRect(taskbar, out taskbarRect) || !GetWindowRect(button, out buttonRect)) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return LastError("Could not read the taskbar button position:");
+        }
+
+        int buttonWidth = buttonRect.Right - buttonRect.Left;
+        int buttonHeight = buttonRect.Bottom - buttonRect.Top;
+        bool horizontalTaskbar =
+            taskbarRect.Right - taskbarRect.Left >= taskbarRect.Bottom - taskbarRect.Top;
+        int maskWidth = horizontalTaskbar ? 1 : buttonWidth;
+        int maskHeight = horizontalTaskbar ? buttonHeight : 1;
+        if (maskWidth <= 0 || maskHeight <= 0) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return "The taskbar's Show desktop button has invalid dimensions.";
+        }
+
+        POINT position = new POINT { X = buttonRect.Left, Y = buttonRect.Top };
+        if (!ScreenToClient(taskbar, ref position)) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return LastError("Could not align the taskbar mask:");
+        }
+
+        if (taskbarMaskWindow != IntPtr.Zero &&
+            (!IsTaskbarMaskWindow() || taskbarMaskParent != taskbar)) {
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) return cleanupError;
+        }
+
+        if (taskbarMaskWindow == IntPtr.Zero) {
+            string classError;
+            if (!RegisterTaskbarMaskClass(out classError)) return classError;
+            taskbarMaskWindow = CreateWindowEx(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                TaskbarMaskClassName, "", WS_CHILD | WS_CLIPSIBLINGS,
+                position.X, position.Y, maskWidth, maskHeight,
+                taskbar, IntPtr.Zero, GetModuleHandle(null), IntPtr.Zero
+            );
+            if (taskbarMaskWindow == IntPtr.Zero)
+                return LastError("Could not create the taskbar mask:");
+            taskbarMaskParent = taskbar;
+            if (!SetLayeredWindowAttributes(taskbarMaskWindow, 0, 255, LWA_ALPHA)) {
+                string error = LastError("Could not configure the taskbar mask:");
+                string cleanupError = DestroyTaskbarMaskWindow();
+                if (cleanupError != null) error += " " + cleanupError;
+                return error;
+            }
+        }
+
+        if (!SetWindowPos(taskbarMaskWindow, IntPtr.Zero, position.X, position.Y,
+                maskWidth, maskHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            string error = LastError("Could not position the taskbar mask:");
+            string cleanupError = DestroyTaskbarMaskWindow();
+            if (cleanupError != null) error += " " + cleanupError;
+            return error;
+        }
+        return null;
+    }
+
+    public static string SyncScreenEdgeMask(bool enabled) {
+        if (!enabled) return DestroyScreenEdgeMaskWindow();
+
+        IntPtr taskbar = FindWindow("Shell_TrayWnd", null);
+        if (taskbar == IntPtr.Zero) {
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return "Could not find the Windows taskbar.";
+        }
+
+        int width = ScreenWidth();
+        int height = ScreenHeight();
+        if (width <= 0 || height <= 0) {
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return "Could not read the primary display dimensions.";
+        }
+
+        RECT taskbarRect;
+        if (!GetWindowRect(taskbar, out taskbarRect)) {
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return LastError("Could not read the taskbar position:");
+        }
+
+        int taskbarWidth = taskbarRect.Right - taskbarRect.Left;
+        int taskbarHeight = taskbarRect.Bottom - taskbarRect.Top;
+        bool horizontalTaskbar = taskbarWidth >= taskbarHeight;
+        int left = Math.Max(0, taskbarRect.Left);
+        int top = Math.Max(0, taskbarRect.Top);
+        int right = Math.Min(width, taskbarRect.Right);
+        int bottom = Math.Min(height, taskbarRect.Bottom);
+        int visibleWidth = right - left;
+        int visibleHeight = bottom - top;
+        int maskWidth;
+        int maskHeight;
+
+        if (horizontalTaskbar) {
+            bool atBottom = taskbarRect.Top >= height / 2 && taskbarRect.Bottom >= height;
+            bool atTop = taskbarRect.Bottom <= height / 2 && taskbarRect.Top <= 0;
+            if ((!atBottom && !atTop) || visibleWidth <= 0 ||
+                visibleHeight <= 0 || visibleHeight > 3) {
+                string cleanupError = DestroyScreenEdgeMaskWindow();
+                return cleanupError;
+            }
+            maskWidth = visibleWidth;
+            maskHeight = visibleHeight;
+        } else {
+            bool atRight = taskbarRect.Left >= width / 2 && taskbarRect.Right >= width;
+            bool atLeft = taskbarRect.Right <= width / 2 && taskbarRect.Left <= 0;
+            if ((!atRight && !atLeft) || visibleHeight <= 0 ||
+                visibleWidth <= 0 || visibleWidth > 3) {
+                string cleanupError = DestroyScreenEdgeMaskWindow();
+                return cleanupError;
+            }
+            maskWidth = visibleWidth;
+            maskHeight = visibleHeight;
+        }
+
+        POINT position = new POINT { X = left, Y = top };
+        if (!ScreenToClient(taskbar, ref position)) {
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) return cleanupError;
+            return LastError("Could not align the screen-edge mask to the taskbar:");
+        }
+
+        if (screenEdgeMaskWindow != IntPtr.Zero &&
+            (!IsScreenEdgeMaskWindow() || screenEdgeMaskParent != taskbar)) {
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) return cleanupError;
+        }
+
+        if (screenEdgeMaskWindow == IntPtr.Zero) {
+            string classError;
+            if (!RegisterTaskbarMaskClass(out classError)) return classError;
+            screenEdgeMaskWindow = CreateWindowEx(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                TaskbarMaskClassName, "", WS_CHILD | WS_CLIPSIBLINGS,
+                position.X, position.Y, maskWidth, maskHeight,
+                taskbar, IntPtr.Zero, GetModuleHandle(null), IntPtr.Zero
+            );
+            if (screenEdgeMaskWindow == IntPtr.Zero)
+                return LastError("Could not create the screen-edge mask:");
+            screenEdgeMaskParent = taskbar;
+            if (!SetLayeredWindowAttributes(screenEdgeMaskWindow, 0, 255, LWA_ALPHA)) {
+                string error = LastError("Could not configure the screen-edge mask:");
+                string cleanupError = DestroyScreenEdgeMaskWindow();
+                if (cleanupError != null) error += " " + cleanupError;
+                return error;
+            }
+        }
+
+        if (!SetWindowPos(screenEdgeMaskWindow, IntPtr.Zero, position.X, position.Y,
+                maskWidth, maskHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            string error = LastError("Could not position the screen-edge mask:");
+            string cleanupError = DestroyScreenEdgeMaskWindow();
+            if (cleanupError != null) error += " " + cleanupError;
+            return error;
+        }
+        return null;
+    }
 
     public static IntPtr DesktopList() {
         IntPtr found = IntPtr.Zero;
@@ -233,6 +573,12 @@ $script:dragCurrent = $null
 $script:selectedZone = -1
 $script:closingForExit = $false
 $script:headlessStartFailed = $false
+$script:taskbarMaskError = $null
+$script:taskbarMaskFailureAt = $null
+$script:taskbarMaskFailureReported = $false
+$script:screenEdgeMaskError = $null
+$script:screenEdgeMaskFailureAt = $null
+$script:screenEdgeMaskFailureReported = $false
 $script:tickFailures = 0
 $script:maxTickFailures = 40   # ~10 s of consecutive failed ticks (250 ms each) before giving up
 
@@ -315,8 +661,64 @@ function Set-IconsVisible([bool]$visible) {
     $script:iconsVisible = $visible
 }
 
+function Update-TaskbarMask {
+    $errorMessage = [DesktopIconsAppNative]::SyncTaskbarMask(
+        $script:maskShowDesktopCheck.Checked
+    )
+    if ($errorMessage) {
+        if ($script:taskbarMaskError -ne $errorMessage) {
+            $script:taskbarMaskError = $errorMessage
+            $script:taskbarMaskFailureAt = $script:zoneClock.ElapsedMilliseconds
+            $script:taskbarMaskFailureReported = $false
+        }
+        if (-not $script:taskbarMaskFailureReported -and
+            ($script:zoneClock.ElapsedMilliseconds - $script:taskbarMaskFailureAt) -ge 2000) {
+            $script:taskbarMaskFailureReported = $true
+            Show-AppError "Could not mask the taskbar's Show desktop bar: $errorMessage"
+        }
+    } else {
+        $script:taskbarMaskError = $null
+        $script:taskbarMaskFailureAt = $null
+        $script:taskbarMaskFailureReported = $false
+    }
+
+    $errorMessage = [DesktopIconsAppNative]::SyncScreenEdgeMask(
+        $script:maskTaskbarEdgeCheck.Checked
+    )
+    if ($errorMessage) {
+        if ($script:screenEdgeMaskError -ne $errorMessage) {
+            $script:screenEdgeMaskError = $errorMessage
+            $script:screenEdgeMaskFailureAt = $script:zoneClock.ElapsedMilliseconds
+            $script:screenEdgeMaskFailureReported = $false
+        }
+        if (-not $script:screenEdgeMaskFailureReported -and
+            ($script:zoneClock.ElapsedMilliseconds - $script:screenEdgeMaskFailureAt) -ge 2000) {
+            $script:screenEdgeMaskFailureReported = $true
+            Show-AppError "Could not mask the bottom screen edge: $errorMessage"
+        }
+    } else {
+        $script:screenEdgeMaskError = $null
+        $script:screenEdgeMaskFailureAt = $null
+        $script:screenEdgeMaskFailureReported = $false
+    }
+}
+
 function Restore-AppState {
     $restoreErrors = @()
+    $taskbarMaskError = [DesktopIconsAppNative]::SyncTaskbarMask($false)
+    if ($taskbarMaskError) {
+        $restoreErrors += "Could not remove the taskbar mask: $taskbarMaskError"
+    }
+    $screenEdgeMaskError = [DesktopIconsAppNative]::SyncScreenEdgeMask($false)
+    if ($screenEdgeMaskError) {
+        $restoreErrors += "Could not remove the screen-edge mask: $screenEdgeMaskError"
+    }
+    $script:taskbarMaskError = $null
+    $script:taskbarMaskFailureAt = $null
+    $script:taskbarMaskFailureReported = $false
+    $script:screenEdgeMaskError = $null
+    $script:screenEdgeMaskFailureAt = $null
+    $script:screenEdgeMaskFailureReported = $false
     if ($null -ne $script:originalIconsVisible) {
         try {
             Set-IconsVisible $script:originalIconsVisible
@@ -355,6 +757,8 @@ function Save-Settings {
         })
         HideIcons = $script:hideIconsCheck.Checked
         HideCursor = $script:hideCursorCheck.Checked
+        MaskTaskbarShowDesktopBar = $script:maskShowDesktopCheck.Checked
+        MaskTaskbarEdgeLine = $script:maskTaskbarEdgeCheck.Checked
         LogErrors = $script:logErrorsCheck.Checked
         HideDelayMs = [int]$script:hideDelayInput.Value
         IdleHideMs = [int]$script:idleHideInput.Value
@@ -394,6 +798,12 @@ function Load-Settings {
     }
     if ($null -ne $settings.HideIcons) { $script:hideIconsCheck.Checked = [bool]$settings.HideIcons }
     if ($null -ne $settings.HideCursor) { $script:hideCursorCheck.Checked = [bool]$settings.HideCursor }
+    if ($null -ne $settings.MaskTaskbarShowDesktopBar) {
+        $script:maskShowDesktopCheck.Checked = [bool]$settings.MaskTaskbarShowDesktopBar
+    }
+    if ($null -ne $settings.MaskTaskbarEdgeLine) {
+        $script:maskTaskbarEdgeCheck.Checked = [bool]$settings.MaskTaskbarEdgeLine
+    }
     if ($null -ne $settings.LogErrors) {
         $script:logErrorsCheck.Checked = [bool]$settings.LogErrors
     }
@@ -423,6 +833,7 @@ function Start-Automation {
         $script:iconsVisible = $script:originalIconsVisible
         $script:headlessStopEvent.Reset()
         Save-Settings
+        Update-TaskbarMask
         $script:activityClock.Restart()
         $script:leftZoneAt = $null
         $script:tickFailures = 0
@@ -431,8 +842,14 @@ function Start-Automation {
         $script:stopButton.Enabled = $true
         $script:statusLabel.Text = 'Running'
     } catch {
+        $startError = $_.Exception.Message
+        try {
+            Restore-AppState
+        } catch {
+            $startError += "`nCould not restore desktop state after start failed: $($_.Exception.Message)"
+        }
         Release-AutomationMutex
-        throw
+        throw $startError
     }
 }
 
@@ -511,8 +928,8 @@ function Set-StartupShortcut([string]$mode) {
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = 'Desktop Icons App'
 $script:form.StartPosition = 'CenterScreen'
-$script:form.ClientSize = [System.Drawing.Size]::new(600, 537)
-$script:form.MinimumSize = [System.Drawing.Size]::new(616, 576)
+$script:form.ClientSize = [System.Drawing.Size]::new(600, 585)
+$script:form.MinimumSize = [System.Drawing.Size]::new(616, 624)
 $script:form.MaximizeBox = $false
 $script:form.ShowInTaskbar = -not $Headless
 $script:form.Opacity = if ($Headless) { 0 } else { 1 }
@@ -585,21 +1002,33 @@ $script:idleHideInput.Increment = 500
 $script:idleHideInput.Value = 3000
 $script:form.Controls.Add($script:idleHideInput)
 
+$script:maskShowDesktopCheck = New-Object System.Windows.Forms.CheckBox
+$script:maskShowDesktopCheck.Text = "Mask taskbar's Show desktop bar while running"
+$script:maskShowDesktopCheck.Location = [System.Drawing.Point]::new(18, 407)
+$script:maskShowDesktopCheck.AutoSize = $true
+$script:form.Controls.Add($script:maskShowDesktopCheck)
+
+$script:maskTaskbarEdgeCheck = New-Object System.Windows.Forms.CheckBox
+$script:maskTaskbarEdgeCheck.Text = "Mask the taskbar's exposed auto-hide edge while running"
+$script:maskTaskbarEdgeCheck.Location = [System.Drawing.Point]::new(18, 432)
+$script:maskTaskbarEdgeCheck.AutoSize = $true
+$script:form.Controls.Add($script:maskTaskbarEdgeCheck)
+
 $script:startupTrayCheck = New-Object System.Windows.Forms.CheckBox
 $script:startupTrayCheck.Text = 'Start with Windows (with notification-area icon)'
-$script:startupTrayCheck.Location = [System.Drawing.Point]::new(18, 407)
+$script:startupTrayCheck.Location = [System.Drawing.Point]::new(18, 457)
 $script:startupTrayCheck.AutoSize = $true
 $script:form.Controls.Add($script:startupTrayCheck)
 
 $script:startupHeadlessCheck = New-Object System.Windows.Forms.CheckBox
 $script:startupHeadlessCheck.Text = 'Start with Windows (no notification-area icon)'
-$script:startupHeadlessCheck.Location = [System.Drawing.Point]::new(18, 428)
+$script:startupHeadlessCheck.Location = [System.Drawing.Point]::new(18, 478)
 $script:startupHeadlessCheck.AutoSize = $true
 $script:form.Controls.Add($script:startupHeadlessCheck)
 
 $script:logErrorsCheck = New-Object System.Windows.Forms.CheckBox
 $script:logErrorsCheck.Text = 'Write errors to errors.log (optional)'
-$script:logErrorsCheck.Location = [System.Drawing.Point]::new(18, 449)
+$script:logErrorsCheck.Location = [System.Drawing.Point]::new(18, 499)
 $script:logErrorsCheck.AutoSize = $true
 
 # Change to $false if you want logging off until the user enables it
@@ -608,27 +1037,27 @@ $script:form.Controls.Add($script:logErrorsCheck)
 
 $script:statusLabel = New-Object System.Windows.Forms.Label
 $script:statusLabel.Text = 'Stopped'
-$script:statusLabel.Location = [System.Drawing.Point]::new(18, 494)
+$script:statusLabel.Location = [System.Drawing.Point]::new(18, 545)
 $script:statusLabel.AutoSize = $true
 $script:form.Controls.Add($script:statusLabel)
 
 $script:startButton = New-Object System.Windows.Forms.Button
 $script:startButton.Text = 'Start'
-$script:startButton.Location = [System.Drawing.Point]::new(306, 482)
+$script:startButton.Location = [System.Drawing.Point]::new(306, 533)
 $script:startButton.Size = [System.Drawing.Size]::new(86, 34)
 $script:form.Controls.Add($script:startButton)
 
 $saveButton = New-Object System.Windows.Forms.Button
 $saveButton.Text = 'Save settings'
-$saveButton.Location = [System.Drawing.Point]::new(402, 482)
+$saveButton.Location = [System.Drawing.Point]::new(402, 533)
 $saveButton.Size = [System.Drawing.Size]::new(86, 34)
 $script:form.Controls.Add($saveButton)
 
 $script:stopButton = New-Object System.Windows.Forms.Button
 $script:stopButton.Text = 'Stop'
-$script:stopButton.Location = [System.Drawing.Point]::new(494, 482)
+$script:stopButton.Location = [System.Drawing.Point]::new(494, 533)
 $script:stopButton.Size = [System.Drawing.Size]::new(86, 34)
-$script:stopButton.Enabled = $true
+$script:stopButton.Enabled = $false
 $script:form.Controls.Add($script:stopButton)
 
 $script:notifyIcon = New-Object System.Windows.Forms.NotifyIcon
@@ -797,7 +1226,7 @@ $script:stopButton.Add_Click({
         Restore-AppState
         Release-AutomationMutex
         $script:startButton.Enabled = $true
-        $script:stopButton.Enabled = $true
+        $script:stopButton.Enabled = $false
         $script:statusLabel.Text = 'Stopped'
     } catch {
         Show-AppError "Could not restore the desktop state: $($_.Exception.Message)"
@@ -806,6 +1235,8 @@ $script:stopButton.Add_Click({
 
 $script:timer.Add_Tick({
     try {
+        Update-TaskbarMask
+
         # Resolution / display changes are detected by polling (no cross-thread event needed)
         $width = [DesktopIconsAppNative]::ScreenWidth()
         $height = [DesktopIconsAppNative]::ScreenHeight()
@@ -892,14 +1323,16 @@ $script:timer.Add_Tick({
 
         $script:timer.Stop()
         $message = $_.Exception.Message
+        $restoreSucceeded = $false
         try {
             Restore-AppState
             Release-AutomationMutex
+            $restoreSucceeded = $true
         } catch {
             $message += "`nDesktop restoration also failed: $($_.Exception.Message)"
         }
-        $script:startButton.Enabled = $true
-        $script:stopButton.Enabled = $true
+        $script:startButton.Enabled = $restoreSucceeded
+        $script:stopButton.Enabled = -not $restoreSucceeded
         $script:statusLabel.Text = 'Error'
         Show-AppError "Automation stopped: $message"
         if ($Headless) { $script:applicationContext.ExitThread() }

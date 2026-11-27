@@ -25,6 +25,10 @@ In the screen preview, drag to add areas where desktop icons should be visible. 
 
 Enable **Hide cursor when idle** to hide the system cursor after the configured idle time. Mouse movement or a button press restores it.
 
+Enable **Mask taskbar's Show desktop bar while running** to cover the thin divider beside Windows' Show desktop button. The mask is click-through, follows the taskbar (including auto-hide), and is removed when you stop or exit the app. This option is off by default.
+
+Enable **Mask the taskbar's exposed auto-hide edge while running** to cover the thin gray line Windows may leave visible for the active app when the taskbar is set to auto-hide. The black, click-through mask follows the taskbar and only covers the one-to-three-pixel portion of it that remains onscreen while retracted; it is removed as the taskbar expands. This option is off by default.
+
 Choose **Start** to apply the selected behavior. **Stop** restores the desktop icon visibility that was in effect when you started, restores system cursors, and stops any headless sign-in instance. Closing the window minimizes the app to the notification area; use the notification-area **Exit** menu to quit and restore the desktop state.
 
 Choose one of the **Start with Windows** options to create a shortcut in the current user's Startup folder:
